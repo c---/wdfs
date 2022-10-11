@@ -24,6 +24,16 @@
  *  that compiling, linking and/or using OpenSSL is allowed.
  */
 
+/*
+ * Modified 2022-10-10 Chris Osgood https://gurumeditation.org
+ *
+ * - FUSE does not include trailing slashes in paths so we add a trailing
+ *   slash for directory (collection) operations as required by WebDAV RFC.
+ *   This fixes wdfs when using strict servers such as nginx.
+ * - FIXME: rmdir should only work on empty directories.
+ * - Cleaned up issues from original code and waitman fork.
+ */
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -57,11 +67,6 @@
 
 static void print_help();
 static int call_fuse_main(struct fuse_args *args);
-
-/* waitman - define these two for use in wdfs_create() */
-static int wdfs_mknod(const char *localpath, mode_t mode, dev_t rdev);
-static int wdfs_open(const char *localpath, struct fuse_file_info *fi);
-
 
 /* define package name and version if config.h is not available. */
 #ifndef HAVE_CONFIG_H
@@ -346,10 +351,11 @@ static void print_debug_infos(const char *method, const char *parameter)
 
 
 /* returns the malloc()ed escaped remotepath on success or NULL on error */
-static char* get_remotepath(const char *localpath)
+/* the dir option adds a trailing slash as required by webdav for collections */
+static char* get_remotepath(const char *localpath, bool_t dir)
 {
 	assert(localpath);
-	char *remotepath = ne_concat(remotepath_basedir, localpath, NULL);
+	char *remotepath = ne_concat(remotepath_basedir, localpath, dir ? "/" : NULL, NULL);
 	if (remotepath == NULL)
 		return NULL;
 	char *remotepath2 = unify_path(remotepath, ESCAPE | LEAVESLASH);
@@ -525,12 +531,11 @@ static int wdfs_getattr(const char *localpath, struct stat *stat)
 		}
 	/* normal mode; no svn mode */
 	} else {
-		remotepath = get_remotepath(localpath);
+		remotepath = get_remotepath(localpath, false);
 	}
 
 	if (remotepath == NULL)
 		return -ENOMEM;
-
 
 	/* stat not found in the cache? perform a propfind to get stat! */
 	if (cache_get_item(stat, remotepath)) {
@@ -545,11 +550,9 @@ static int wdfs_getattr(const char *localpath, struct stat *stat)
 				session, remotepath, NE_DEPTH_ZERO, properties_fileattr,
 				wdfs_getattr_propfind_callback, stat);
 		}
-
 		if (ret != NE_OK) {
 			fprintf(stderr, "## PROPFIND error in %s(): %s\n",
 				__func__, ne_get_error(session));
-
 			FREE(remotepath);
 			return -ENOENT;
 		}
@@ -618,6 +621,18 @@ static void wdfs_readdir_propfind_callback(
 }
 
 
+static bool_t wdfs_isdir(const char *localpath)
+{
+	assert(localpath);
+
+	struct stat stat;
+	if (wdfs_getattr(localpath, &stat))
+		return false;
+
+	return S_ISDIR(stat.st_mode);
+}
+
+
 /* this method adds the files to the requested directory using the webdav method
  * propfind. the server responds with status code 207 that contains metadata of 
  * all files of the requested collection. for each file the method 
@@ -658,7 +673,7 @@ static int wdfs_readdir(
 		}
 	/* normal mode; no svn mode */
 	} else {
-		item_data.remotepath = get_remotepath(localpath);
+		item_data.remotepath = get_remotepath(localpath, false);
 	}
 
 	if (item_data.remotepath == NULL)
@@ -705,7 +720,7 @@ static int wdfs_open(const char *localpath, struct fuse_file_info *fi)
 			">> %s() by PID %d\n", __func__, fuse_get_context()->pid);
 	}
 
-	assert(localpath &&  &fi);
+	assert(localpath && fi);
 
 	struct open_file *file = g_new0(struct open_file, 1);
 	file->modified = false;
@@ -719,7 +734,7 @@ static int wdfs_open(const char *localpath, struct fuse_file_info *fi)
 	if (wdfs.svn_mode == true && g_str_has_prefix(localpath, svn_basedir))
 		remotepath = svn_get_remotepath(localpath);
 	else
-		remotepath = get_remotepath(localpath);
+		remotepath = get_remotepath(localpath, false);
 
 	if (remotepath == NULL) {
 		FREE(file);
@@ -771,7 +786,7 @@ static int wdfs_read(
 	if (wdfs.debug == true)
 		print_debug_infos(__func__, localpath);
 
-	assert(localpath && buf &&  &fi);
+	assert(localpath && buf && fi);
 
 	struct open_file *file = (struct open_file*)(uintptr_t)fi->fh;
 
@@ -790,11 +805,10 @@ static int wdfs_write(
 	const char *localpath, const char *buf, size_t size,
 	off_t offset, struct fuse_file_info *fi)
 {
-
 	if (wdfs.debug == true)
 		print_debug_infos(__func__, localpath);
 
-	assert(localpath && buf &&  &fi);
+	assert(localpath && buf && fi);
 
 	/* data below svn_basedir is read-only */
 	if (wdfs.svn_mode == true && g_str_has_prefix(localpath, svn_basedir))
@@ -827,7 +841,7 @@ static int wdfs_release(const char *localpath, struct fuse_file_info *fi)
 
 	struct open_file *file = (struct open_file*)(uintptr_t)fi->fh;
 
-	char *remotepath = get_remotepath(localpath);
+	char *remotepath = get_remotepath(localpath, false);
 	if (remotepath == NULL)
 		return -ENOMEM;
 
@@ -899,7 +913,7 @@ static int wdfs_truncate(const char *localpath, off_t size)
 	 *  4. read from fh_out and put file to the server
 	 */
 
-	char *remotepath = get_remotepath(localpath);
+	char *remotepath = get_remotepath(localpath, false);
 	if (remotepath == NULL)
 		return -ENOMEM;
 
@@ -970,13 +984,13 @@ static int wdfs_ftruncate(
 	if (wdfs.debug == true)
 		print_debug_infos(__func__, localpath);
 
-	assert(localpath &&  &fi);
+	assert(localpath && fi);
 
 	/* data below svn_basedir is read-only */
 	if (wdfs.svn_mode == true && g_str_has_prefix(localpath, svn_basedir))
 		return -EROFS;
 
-	char *remotepath = get_remotepath(localpath);
+	char *remotepath = get_remotepath(localpath, false);
 	if (remotepath == NULL)
 		return -ENOMEM;
 
@@ -1017,25 +1031,6 @@ static int wdfs_ftruncate(
 }
 
 
-/* author waitman, 08.11.2015 implement create for fuse */
-static int wdfs_create(const char *localpath, mode_t mode, struct fuse_file_info *fi)
-{
-
-	int ret;
-	dev_t rdev;
-	rdev = (dev_t)0;
-
-	ret = wdfs_mknod(localpath,mode,rdev);
-	if (ret!=0)
-	{
-		return ret;
-	}
-	ret = wdfs_open(localpath, fi);
-	return ret;
-
-}
-
-
 /* author jens, 28.07.2005 18:15:12, location: noedlers garden in trubenhausen
  * this method creates a empty file using the webdav method put. */
 static int wdfs_mknod(const char *localpath, mode_t mode, dev_t rdev)
@@ -1045,26 +1040,19 @@ static int wdfs_mknod(const char *localpath, mode_t mode, dev_t rdev)
 
 	assert(localpath);
 
-
 	/* data below svn_basedir is read-only */
 	if (wdfs.svn_mode == true && g_str_has_prefix(localpath, svn_basedir))
 		return -EROFS;
 
-
-
-	char *remotepath = get_remotepath(localpath);
+	char *remotepath = get_remotepath(localpath, false);
 	if (remotepath == NULL)
 		return -ENOMEM;
-
-
 
 	int fh = get_filehandle();
 	if (fh == -1) {
 		FREE(remotepath);
 		return -EIO;
 	}
-
-
 
 	if (ne_put(session, remotepath, fh)) {
 		fprintf(stderr, "## PUT error: %s\n", ne_get_error(session));
@@ -1073,10 +1061,21 @@ static int wdfs_mknod(const char *localpath, mode_t mode, dev_t rdev)
 		return -EIO;
 	}
 
-
 	close(fh);
 	FREE(remotepath);
 	return 0;
+}
+
+
+/* author waitman, 08.11.2015 implement create for fuse */
+static int wdfs_create(const char *localpath, mode_t mode, struct fuse_file_info *fi)
+{
+	int ret = wdfs_mknod(localpath, mode, 0);
+	if (ret)
+		return ret;
+
+	ret = wdfs_open(localpath, fi);
+	return ret;
 }
 
 
@@ -1093,7 +1092,7 @@ static int wdfs_mkdir(const char *localpath, mode_t mode)
 	if (wdfs.svn_mode == true && g_str_has_prefix(localpath, svn_basedir))
 		return -EROFS;
 
-	char *remotepath = get_remotepath(localpath);
+	char *remotepath = get_remotepath(localpath, true);
 	if (remotepath == NULL)
 		return -ENOMEM;
 
@@ -1121,7 +1120,7 @@ static int wdfs_unlink(const char *localpath)
 	if (wdfs.svn_mode == true && g_str_has_prefix(localpath, svn_basedir))
 		return -EROFS;
 
-	char *remotepath = get_remotepath(localpath);
+	char *remotepath = get_remotepath(localpath, wdfs_isdir(localpath));
 	if (remotepath == NULL)
 		return -ENOMEM;
 
@@ -1156,6 +1155,13 @@ static int wdfs_unlink(const char *localpath)
 }
 
 
+/* FIXME: */
+static int wdfs_rmdir(const char *localpath)
+{
+   return wdfs_unlink(localpath);
+}
+
+
 /* author jens, 31.07.2005 19:13:39, location: heli at heinemanns
  * this methods renames a file. it uses the webdav method move to do that. */
 static int wdfs_rename(const char *localpath_src, const char *localpath_dest)
@@ -1173,8 +1179,10 @@ static int wdfs_rename(const char *localpath_src, const char *localpath_dest)
 		 g_str_has_prefix(localpath_dest, svn_basedir)))
 		return -EROFS;
 
-	char *remotepath_src  = get_remotepath(localpath_src);
-	char *remotepath_dest = get_remotepath(localpath_dest);
+	bool_t dir = wdfs_isdir(localpath_src);
+
+	char *remotepath_src  = get_remotepath(localpath_src, dir);
+	char *remotepath_dest = get_remotepath(localpath_dest, dir);
 	if (remotepath_src == NULL || remotepath_dest == NULL )
 		return -ENOMEM;
 
@@ -1291,7 +1299,7 @@ static struct fuse_operations wdfs_operations = {
 	.mkdir		= wdfs_mkdir,
 	/* webdav treats file and directory deletions equal, both use wdfs_unlink */
 	.unlink		= wdfs_unlink,
-	.rmdir		= wdfs_unlink,
+	.rmdir		= wdfs_rmdir,
 	.rename		= wdfs_rename,
 	.chmod		= wdfs_chmod,
 	/* utime should be better named setattr
