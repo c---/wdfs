@@ -1074,8 +1074,7 @@ static int wdfs_create(const char *localpath, mode_t mode, struct fuse_file_info
 	if (ret)
 		return ret;
 
-	ret = wdfs_open(localpath, fi);
-	return ret;
+	return wdfs_open(localpath, fi);
 }
 
 

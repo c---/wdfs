@@ -1,3 +1,10 @@
+** Fix DAV operations **
+
+This patched version of wdfs fixes the way DAV commands are issued so that it
+conforms to the official DAV specification.
+
+-----
+
 
 abstract:
   wdfs is a webdav filesystem with special features for accessing subversion
